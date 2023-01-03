@@ -1,0 +1,221 @@
+---
+title: "Predicting NFL Win Totals"
+author: 
+- "Author: Timmy Hernandez"
+- "Email: therndez@yahoo.com"
+- "Twitter: @Timboslice003"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(randomForest)
+```
+
+## **Abstract**
+
+The Purpose of this project was to use a Random Forest model to project each NFL Team's win total before the season begins. Using 5 input parameters, the model is trained on data consisting of NFL teams from the 2009 season up until the 2021 season. Historical data from sportsbooks used as a comparison had a root mean squared error of 2.6 wins between a team's predicted wins and actual wins. Running the model on the test data removed from the training data resulted in a root mean squared error of 2.7 wins.
+
+## **Acknowledgements**
+The data used to create the model is from [Pro Football Focus](https://www.pff.com/) (PFF), [NFLverse](https://nflverse.nflverse.com/), and [Sports Odds History](https://sportsoddshistory.com/). The raw data from PFF requires a subscription and can not be shared. A big thank you to the NFLverse Discord for help with the code and model problems I experienced.
+
+## **Independent Variables**
+The following independent variables were used as inputs to train and test the model:
+
++ Prior Season's Relative Performance
+  - A metric of a team's offensive and defensive performance compared to the rest of the NFL in a given season.
++ Prior Season's Team QB PFF Offensive Grade
+  - Combination of all a team's QBs PFF Grades weighted by number of drop backs.
++ Prior Season's Strength of Schedule (SOS)
+  - Combined winning percentage of all a team's opponents in a season.
++ Upcoming Season's Expected Strength of Schedule
+  - Expected SOS using sportsbooks' Pre-Season Win Totals of all a team's opponents.
++ Upcoming Season's Starting QB's most recent PFF Grade
+  - Team's week 1 starting QB's previous season PFF Grade.
+
+#### **Relative Performance**
+A team's win-loss record is not always the best representation of their performance on the field. Ultimately it does decide who moves on to the playoffs, but wins in one season can only tell us so much about how many wins the team will win in the next season. Since 2008, a team's winning percentage in season N has a correlation coefficient of 0.38 with the team's winning percentage in season N + 1, but this can be improved upon.
+
+A common metric used to measure each NFL team's performance is Expected Points Added (EPA), which can be read about [here](https://www.the33rdteam.com/breakdowns/epa-explained/). By combining a team's EPA/play on offense and defense, the team's total performance can be described by one metric, although it is not adjusted to strength of schedule. Similar to Ben Baldwin's [team tiers](https://rbsdm.com/stats/stats/), offensive EPA is weighted 1.5 times more than defensive EPA due to it being more stable and predictive.  In the data frame constructed using NFLverse play by play data, EPA/play is standardized within each NFL season since EPA can change depending on the season. Thus the final metric, Relative Performance, shows how well a team performed compared to league average in a given season. A league average team would have a Relative Performance value of zero, while a team one standard deviation above average would have a value of one, a team one standard deviation below average would have a value of -1, and so on. The plot below shows a team's Relative Performance is a great indicator of a team's success. Using 2020 and 2021 as examples, only four teams finished inside the top 14 in relative performance but failed to make the playoffs. Three of these teams, the 2020 Dolphins, 2021 Chargers, and 2021 Colts, were eliminated from playoff contention in the last week of the regular season. 
+
+![](rel_perf.png)
+
+##### Correlation to Winning Percentage
+The plots below show, unsurprisingly, since 2009 a team's Relative Performance had a strong correlation coefficient of 0.87 with the team's win percentage. More importantly, however, a team's Relative Performance had a correlation coefficient of 0.42 with the team's win percentage the following season, 10% greater than just using wins.
+
+```{r image_grobs, fig.show = "hold", out.width = "50%", fig.aligh = "default", echo = FALSE}
+knitr::include_graphics("rp_wp_cor.png")
+knitr::include_graphics("rp_wp_cor2.png")
+
+```
+
+#### **Prior Season's Team QB PFF Offensive Grade**
+The quarterback position is the most important position on a football team. Knowing this, variation of QB play from one season to the next can have a major impact on a team's performance. The purpose of this independent variable is to capture the overall season-long QB play for a team in a given season. This metric is weighted by number of drop backs. For example, if player A and player B both had 250 drop backs on the season, the Team's QB Grade would be the average of the two. If player A had 300 drop backs and player B had 200, the Team QB Grade would be valued closer to player A's PFF grade. For teams that started a rookie QB for week 1, the average rookie QB PFF grade, 69.29, was used.
+
+#### **Prior Season's Strength of Schedule**
+The combined winning percentage of all of a team's opponents in a given season. The purpose of the independent variable is to help determine if a team over performed their true ability because they played bad opponents, or if they under performed their true ability because they played good opponents.
+
+
+#### **Upcoming Season's Expected Strength of Schedule**
+Obviously, it is much easier to win games when facing easier opponents. By using sportsbooks' preseason win totals, a team's expected SOS can be calculated. While it is very difficult to predict win totals for every team, historically a team's expected SOS has been moderately correlated to its actual SOS. With a correlation value of .42, illustrated by the plot below, the purpose of this independent variable is to estimate the difficulty of a team's schedule in a given season. 
+![](sos_compare.png)
+
+#### **Upcoming Season's Starting QB's most recent PFF Grade**
+The purpose of this independent variable is to help predict which teams will take a step forward or a step backward with a new quarterback. Recent examples of this are the 2020 Tampa Bay Buccaneers (Tom Brady) and the 2021 Los Angeles Rams (Matthew Stafford) both winning the Super Bowl in large part to their upgrade at the quarterback position. 
+
+## **Training the Model**
+Through data joining and cleaning, the data set used to create the model can be seen as below:
+```{r , echo = FALSE}
+#Load csvs
+wins <- read.csv('wins_data.csv')
+rel_perf <- read.csv('rel_perf.csv')
+sos <- read.csv('sos_wins.csv')
+team_grades <- read.csv('team_qb_grades.csv')
+lastQB_df <- read.csv('lastPFF.csv')
+
+
+#Create Final DF for model
+my_df <- rel_perf %>%
+  select(team, season) %>%
+  mutate(last_season = season - 1) %>%
+  left_join(rel_perf, by = c('last_season' = 'season', 'team')) %>%
+  rename(last_rel_perf = rel_perf) %>%
+  left_join(sos %>% select(season, team = team_abbr, act_sos),
+            by = c('last_season' = 'season', 'team')) %>%
+  rename(last_sos = act_sos) %>%
+  left_join(team_grades,
+            by = c('last_season' = 'season', 'team' = 'team_name')) %>%
+  rename(last_grade = team_grade) %>%
+  left_join(sos %>% select(season, team = team_abbr, exp_sos),
+            by = c('season', 'team')) %>%
+  left_join(lastQB_df %>% select(team, season, last_QBgrade = last_grade), 
+            by = c('season', 'team')) %>%
+  left_join(wins %>% select(season, team, wp),
+            by = c('season', 'team')) %>%
+  select(-last_season)
+
+#Remove NAs from data
+model_ready <-my_df[complete.cases(my_df),] 
+head(model_ready, 5)
+
+```
+The model will use the columns last_rel_perf, last_sos, last_grade, exp_sos, and last_QBgrade, to predict a team's winning percentage shown in column wp. When viewing the model results, winning percentage will be changed to wins by multiplying it by games played (17 for 2021 and 16 for all other seasons).
+
+
+After splitting the data into training, validation, and testing sets, and running through a handful of tweaks and iterations of the model, the code below provides a random forest model and the importance of each independent variable.
+
+```{r, echo = FALSE}
+#Set seed for continuity
+set.seed(26)
+##### Split Data in Train, Validate, Test sets #####
+#Training and Validation Data
+training_rows <- sample(1:nrow(model_ready),0.7*nrow(model_ready),replace = F)
+training_data <- model_ready[training_rows,]
+
+#Split Validation Data
+validation_rows <- sample(1:nrow(training_data),0.3*nrow(training_data),replace=F)
+validation <- training_data[validation_rows,]
+
+#Split Train Data
+train <- training_data[-validation_rows,]
+
+#Test Data
+model_test_data <- model_ready[-training_rows,]
+```
+```{r, echo = TRUE}
+#Model
+rf1 <- randomForest(data = train, wp ~ last_rel_perf + last_sos + 
+               exp_sos + last_grade + last_QBgrade,
+             mtry = 4, ntree = 1000)
+
+varImpPlot(rf1)
+```
+
+As expected, the prior season's Relative Performance was the most important factor. Goods teams tend to stay good. Bad teams tend to stay bad. The other four variables were all of similar importance, with the week 1 starting QB's PFF grade from the prior season as the slightly most important of the group.
+
+## **Testing the Model**
+Using the model to predict the winning percentage for the teams in the test data set results in the plot below. [The Root Mean Square Error](https://towardsdatascience.com/what-does-rmse-really-mean-806b65f2e48e) (RMSE) of the test data set is 2.7 wins. The Sports Odds History historical data, which used a variety of sportsbooks through the years, had an RMSE of 2.6 wins. Considering only 5 variables were used in a very basic model, the results are very promising. Looking into where the model made mistakes, as well as adding more independent variables should bring better results.
+```{r, echo=FALSE, message = FALSE}
+model_test_data$pred_wp <- predict(rf1,model_test_data)
+
+test_df <- model_test_data %>%
+  mutate(wins = ifelse(season == 2021,round(wp*17,1),round(wp*16,1)),
+         pred_wins = ifelse(season == 2021,round(pred_wp*17,1),round(pred_wp*16,1)))
+
+test_df %>% ggplot(aes(x = pred_wins, wins)) +
+  geom_point() +
+  geom_smooth(method = 'lm', se = FALSE) +
+  labs(x = 'Predicted Wins',
+       y = 'Actual Wins') +
+  theme(plot.title = element_text(size = 24, face = 'bold', hjust = .5),
+        plot.subtitle = element_text(size = 16, hjust = .5),
+        axis.title = element_text(size = 17, face = 'bold'),
+        axis.text.y = element_text(size = 13, face = 'bold', color = 'black'),
+        axis.text.x = element_text(size = 13, face = 'bold', color = 'black'),
+        plot.background = element_rect('white'),
+        panel.border = element_rect(fill = 'transparent', 'black'),
+        plot.caption = element_text(size = 13, face = 'bold', color = 'black'))
+```
+
+## **Evaluating the Results**
+The 2021 season will be used to evaluate the results and look at what teams the model missed on. The "NFL Teams' Relative Performance" plot shown previously will help identify some differences between teams in 2020 and 2021. The top 3 underrated teams and the top 3 overrated teams by the model are shown below. For some of the teams, there were clear reasons as to why the model missed on them while for others there were not.
+```{R, echo = FALSE}
+
+res_2021 <- model_ready %>%
+  filter(season == 2021) %>%
+  mutate(wins = round(wp*17,1))
+
+res_2021$pred_wp = predict(rf1,res_2021)
+res_2021$pred_wins = round(res_2021$pred_wp*17,2)
+res_2021$diff = res_2021$pred_wins - res_2021$wins
+
+team_info <- nflreadr::load_teams() %>%
+  select(team_abbr, team_logo_wikipedia)
+
+top4 <- res_2021 %>%
+  select(team, pred_wins, wins, diff) %>%
+  arrange(diff) %>%
+  slice(1:3,30:32) %>%
+  left_join(team_info, by = c('team' = 'team_abbr')) %>%
+  select(team_logo_wikipedia, pred_wins, wins, diff)
+
+top4 %>% gt::gt() %>%
+  gtExtras::gt_img_rows(columns = team_logo_wikipedia) %>%
+  gt::cols_label(team_logo_wikipedia = '',
+                 pred_wins = 'Predicted Wins',
+                 wins = 'Actual Wins',
+                 diff = 'Difference') %>%
+  gt::cols_align('center') %>%
+  gtExtras::gt_theme_538()
+
+
+```
+
+* **Dallas Cowboys**
+  - The Cowboys had an awful 2020 relative performance. They did get Dak Prescott back from injury, which resulted in much better QB play, but the model took this into account. What the model did not account for is the Cowboys defense becoming one of the best units in the league. Also, the expected SOS for the Cowboys was 0.503, but in reality their schedule was slightly easier with a SOS of .488.
+* **Cincinnati Bengals**
+  - The 2021 Bengals winning 10 games was a surprise to most statistical models. The main reason was QB play. In 2020 their team QB PFF grade was 69.81 from multiple QBs. The model used Joe Burrow's 75.10 rookie PFF grade as an input, but Joe Burrow ended up as the highest rated QB in the NFL with a 91.7 PFF grade. The model did not account for such a massive leap. The Bengals also had a fortunate schedule as their expected SOS was 0.526 but their actual sos was only 0.472, a rather large difference.
+* **Tennessee Titans**
+  - While the Titans won 12 games in 2021, their true performance may not have been reflected by such a good record. Looking at their relative performance, they were actually only slightly above average. The results of their schedule show the Titans won a surprisingly high 6 games by 3 points or less. The model's prediction of the talent level of the 2021 Titans may have been more accurate than it seems on the surface, but the Titans barely squeaked by in enough games to put them at 12 wins and the first seed in the AFC playoffs.
+* **Atlanta Falcons**
+  - A prediction within 2 wins of the actual season total is actually pretty good here, however the model may have gotten lucky. Despite their QB Matt Ryan's performance dropping (83.1 PFF grade in 2020 vs 74.7 in 2021) they still won 7 games. Their expected SOS was 0.503, but their actual SOS was .472. These two metrics may have counteracted each other to predict the Falcons would perform similar in 2021 as they did in 2020, in which they were actually a roughly average team despite going 4-12. The reality is the 7 wins the Falcons ended the season with is not a good representation of how poor of a team they were in 2021 and the model was fortunate to not miss this one by more.
+* **Baltimore Ravens**
+  - Lamar Jackson missed 5 games in 2021 and the Ravens only won one of these games. Given how close the games they lost were, it's a fair assumption they would have been closer to their predicted 10 wins had Jackson stayed healthy.
+* **Jacksonville Jaguars**
+  - There is not a clear reason as to why the model missed this much on the Jaguars. Their SOS was not too different from the expected SOS (0.512 vs 0.495), their relative performance was equally as bad in 2020 as it was in 2021, but Trevor Lawrence's 59.6 PFF grade was roughly 10 points lower than the average rookie. Still, a team with this preseason profile should not be expected to win 7.69 games.
+* **Other Issues**
+  - It seems the model struggles with predicting the best teams to win a lot of games and the worst teams to win very few, even when correctly identifying them as the best/worst teams in the league. The Rams (10.89 vs 12), Packers (10.85 vs 13), Chiefs (10.61 vs 12), and Buccaneers (10.25 vs 13) were all accurately predicted to finish in the top 5 in the league in total wins. Similarly, the Lions (4.83 vs 3.5), Giants (5.08 vs 4), Jets (5.38 vs 4), and Texans (5.65 vs 4) were all accurately predicted to finish in the bottom 5 in the league in total wins. Correctly identifying these teams in their correct place, but predicting win totals too low for the best teams and too high for the worst teams may signal the model is skewing teams towards the NFL mean of 8.5 wins.
+ 
+## **2022 Predictions**
+  ![](2022_wo_border.png){width=50%}
+ 
+ 
+ 
+ 
+  
+## **Potential Changes**
+When looking ahead, there are a few tweaks to the model that may result in better results. First, adding a garbage time filter when calculating the previous season's Relative Performance may help identify a team's true talent better. Games that end in blowouts can often end in meaningless 4th quarters that can change a team's seasonal EPA/play. Second, a better metric for predicting QB play can be used rather than just using the QB's previous PFF grade or the rookie average. This could take into account years of experience, expected O-line play, expected WR play, or draft pick for rookies. Third, other position groups PFF grades could be used as an independent variable. Some examples were just mentioned but others would be the team's expected pass rush and coverage grades. Lastly, rather than trying to predict all the win totals as one, a model could be used to predict a team's true ability. That metric could be combined with the season's schedule to simulate every game to come to a predicted win total for each team.
+
